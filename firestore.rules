@@ -2,62 +2,35 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     // ===============================================================
-    // Assumed Data Model
+    // Assumed Data Model (Open Mode)
     // ===============================================================
-    //
-    // Collection: quotes
-    // Document ID: auto-generated
-    // Fields:
-    //   - content: string (required, 1-500 chars)
-    //   - category: string (required, enum: workplace, romance, slacking)
-    //   - authorId: string (required, matches auth.uid)
-    //   - createdAt: timestamp (required)
-    //
-    // Collection: messages
-    // Document ID: auto-generated
-    // Fields:
-    //   - content: string (required, 1-100 chars)
-    //   - color: string (required, HEX format)
-    //   - authorId: string (required, matches auth.uid)
-    //   - createdAt: timestamp (required)
-    //
-    // ===============================================================
-
+    
     // Helper Functions
-    function isAuthenticated() {
-      return request.auth != null;
-    }
-
-    function isOwner(authorId) {
-      return isAuthenticated() && request.auth.uid == authorId;
-    }
-
     function isValidQuote(data) {
-      return data.content is string && data.content.size() >= 1 && data.content.size() <= 500 &&
+      return data.content is string && data.content.size() >= 1 && data.content.size() <= 1000 &&
              data.category in ['workplace', 'romance', 'slacking'] &&
-             data.authorId == request.auth.uid &&
+             data.authorId is string &&
              data.createdAt is timestamp;
     }
 
     function isValidMessage(data) {
-      return data.content is string && data.content.size() >= 1 && data.content.size() <= 100 &&
+      return data.content is string && data.content.size() >= 1 && data.content.size() <= 200 &&
              data.color is string && data.color.matches("^#[0-9a-fA-F]{6}$") &&
-             data.authorId == request.auth.uid &&
+             data.authorId is string &&
              data.createdAt is timestamp;
     }
 
-    // Rules
+    // Rules - Fully Public Read/Create with Validation
     match /quotes/{quoteId} {
-      allow read: if isAuthenticated();
-      allow create: if isAuthenticated() && isValidQuote(request.resource.data);
-      // No updates or deletes for now to keep it a collaborative stream
-      allow delete: if request.auth.token.email == "1191728729@qq.com";
+      allow read: if true;
+      allow create: if isValidQuote(request.resource.data);
+      allow delete: if false; // Only admin via console
     }
 
     match /messages/{messageId} {
-      allow read: if isAuthenticated();
-      allow create: if isAuthenticated() && isValidMessage(request.resource.data);
-      allow delete: if request.auth.token.email == "1191728729@qq.com";
+      allow read: if true;
+      allow create: if isValidMessage(request.resource.data);
+      allow delete: if false;
     }
   }
 }

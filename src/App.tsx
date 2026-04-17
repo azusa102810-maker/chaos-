@@ -6,9 +6,18 @@
 import { useState, useEffect, useCallback, useRef, FormEvent } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Copy, RefreshCw, Sparkles, Heart, Briefcase, Coffee, CheckCircle2, MessageCircle, Github, Plus, LogIn, LogOut, User } from "lucide-react";
-import { auth, db, googleProvider, handleFirestoreError, OperationType, signInAnonymously } from "./firebase";
-import { onAuthStateChanged, signOut, User as FirebaseUser } from "firebase/auth";
+import { db, handleFirestoreError, OperationType } from "./firebase";
 import { collection, onSnapshot, addDoc, query, orderBy, limit, serverTimestamp, Timestamp } from "firebase/firestore";
+
+// --- Helpers ---
+const getGuestId = () => {
+  let id = localStorage.getItem('guest_id');
+  if (!id) {
+    id = 'guest_' + Math.random().toString(36).substr(2, 9);
+    localStorage.setItem('guest_id', id);
+  }
+  return id;
+};
 
 // --- Types ---
 type Category = "workplace" | "romance" | "slacking";
@@ -603,7 +612,7 @@ function FlyingShouts({ shouts }: { shouts: Shout[] }) {
 }
 
 export default function App() {
-  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [guestId] = useState(getGuestId);
   const [activeCategory, setActiveCategory] = useState<Category>("workplace");
   const [currentQuote, setCurrentQuote] = useState<Quote | null>(null);
   const [showToast, setShowToast] = useState(false);
@@ -613,34 +622,28 @@ export default function App() {
   const [isQuoteSubmitOpen, setIsQuoteSubmitOpen] = useState(false);
   const [quotesData, setQuotesData] = useState<Record<Category, Quote[]>>(INITIAL_QUOTES);
   const [messages, setMessages] = useState<string[]>(INITIAL_MESSAGES);
+  const historyKey = 'madness_view_history';
   const [shouts, setShouts] = useState<Shout[]>([]);
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
+  const viewHistory = useRef<Record<Category, (string | number)[]>>((() => {
+    try {
+      const saved = localStorage.getItem(historyKey);
+      return saved ? JSON.parse(saved) : { workplace: [], romance: [], slacking: [] };
+    } catch {
+      return { workplace: [], romance: [], slacking: [] };
+    }
+  })());
 
-  // Anonymous Auth Logic
+  // Save history whenever it changes
   useEffect(() => {
-    const initAuth = async () => {
-      try {
-        if (!auth.currentUser) {
-          await signInAnonymously(auth);
-        }
-      } catch (err) {
-        console.error("Anonymous login failed:", err);
-      }
-    };
-    initAuth();
-
-    return onAuthStateChanged(auth, (u) => {
-      setUser(u);
-    });
-  }, []);
+    localStorage.setItem(historyKey, JSON.stringify(viewHistory.current));
+  }, [currentQuote]);
 
   // Firestore Synchronizers
   useEffect(() => {
-    if (!user) return;
-
     const q = query(collection(db, "quotes"), orderBy("createdAt", "desc"), limit(200));
     const unsubscribe = onSnapshot(q, (snapshot) => {
-      // Use proper deep-ish clone for categories to avoid mutating INITIAL_QUOTES
+      console.log(`[Firestore] Received ${snapshot.size} quotes from clouds.`);
       const newQuotes: Record<Category, Quote[]> = {
         workplace: [...INITIAL_QUOTES.workplace],
         romance: [...INITIAL_QUOTES.romance],
@@ -651,7 +654,7 @@ export default function App() {
         const data = doc.data();
         const cat = data.category as Category;
         if (newQuotes[cat]) {
-          // Add to the front so they have higher chance or just different order
+          // Add to the front so they are prioritized
           newQuotes[cat].unshift({ id: doc.id, content: data.content });
         }
       });
@@ -659,11 +662,9 @@ export default function App() {
     }, (err) => handleFirestoreError(err, OperationType.LIST, "quotes"));
 
     return () => unsubscribe();
-  }, [user]);
+  }, []);
 
   useEffect(() => {
-    if (!user) return;
-
     const q = query(collection(db, "messages"), orderBy("createdAt", "desc"), limit(50));
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const newMsgs: string[] = [];
@@ -674,10 +675,8 @@ export default function App() {
           const data = change.doc.data();
           const createdAt = (data.createdAt as Timestamp)?.toMillis();
           
-          // Skip if it was our own local shout (id starts with local-)
-          // or if the message is too old
           const isRecent = createdAt ? (Date.now() - createdAt < 10000) : true;
-          const isNotMe = data.authorId !== user.uid;
+          const isNotMe = data.authorId !== guestId;
 
           if (isRecent && isNotMe) {
             const newShout: Shout = {
@@ -694,11 +693,10 @@ export default function App() {
 
       if (newShouts.length > 0) {
         setShouts(prev => [...prev, ...newShouts]);
-        // Cleanup after delay
         newShouts.forEach(s => {
           setTimeout(() => {
             setShouts(prev => prev.filter(ps => ps.id !== s.id));
-          }, 18000); // Wait for transit
+          }, 18000);
         });
       }
       
@@ -709,7 +707,7 @@ export default function App() {
     }, (err) => handleFirestoreError(err, OperationType.LIST, "messages"));
 
     return () => unsubscribe();
-  }, [user]);
+  }, [guestId]);
 
   const activeColor = CATEGORIES.find(c => c.id === activeCategory)?.color || "#d63384";
   const activeShadow = CATEGORIES.find(c => c.id === activeCategory)?.shadow || "rgba(214, 51, 132, 0.3)";
@@ -718,17 +716,47 @@ export default function App() {
   const generateNewQuote = useCallback(() => {
     setIsRefreshing(true);
     const categoryQuotes = quotesData[activeCategory];
-    let newQuote: Quote;
-
+    
     if (categoryQuotes.length === 0) {
       setCurrentQuote({ id: 0, content: "暂无文案，快去投递吧！" });
       setIsRefreshing(false);
       return;
     }
 
-    do {
-      newQuote = categoryQuotes[Math.floor(Math.random() * categoryQuotes.length)];
-    } while (currentQuote && newQuote.id === currentQuote.id && categoryQuotes.length > 1);
+    // Smart Randomization: Filter out recently viewed quotes
+    const history = viewHistory.current[activeCategory];
+    
+    // Separate user quotes (string IDs) from initial quotes (number IDs)
+    const userQuotes = categoryQuotes.filter(q => typeof q.id === 'string');
+    const systemQuotes = categoryQuotes.filter(q => typeof q.id === 'number');
+
+    // Priority: Try to pick from user quotes first if not in history
+    let availableUserQuotes = userQuotes.filter(q => !history.includes(q.id) && q.id !== currentQuote?.id);
+    let availableSystemQuotes = systemQuotes.filter(q => !history.includes(q.id) && q.id !== currentQuote?.id);
+
+    let newQuote: Quote;
+
+    // 70% chance to pick user content if available, else system content
+    if (availableUserQuotes.length > 0 && Math.random() < 0.7) {
+      newQuote = availableUserQuotes[Math.floor(Math.random() * availableUserQuotes.length)];
+    } else if (availableSystemQuotes.length > 0) {
+      newQuote = availableSystemQuotes[Math.floor(Math.random() * availableSystemQuotes.length)];
+    } else if (availableUserQuotes.length > 0) {
+      newQuote = availableUserQuotes[Math.floor(Math.random() * availableUserQuotes.length)];
+    } else {
+      // Emergency: reset history
+      viewHistory.current[activeCategory] = currentQuote ? [currentQuote.id] : [];
+      newQuote = categoryQuotes.find(q => q.id !== currentQuote?.id) || categoryQuotes[0];
+    }
+    
+    // Update history
+    if (newQuote) {
+      viewHistory.current[activeCategory].push(newQuote.id);
+      const maxHistory = Math.floor(categoryQuotes.length * 0.8);
+      if (viewHistory.current[activeCategory].length > maxHistory) {
+        viewHistory.current[activeCategory].shift();
+      }
+    }
 
     setTimeout(() => {
       setCurrentQuote(newQuote);
@@ -737,18 +765,13 @@ export default function App() {
   }, [activeCategory, currentQuote, quotesData]);
 
   const addMessage = async (msg: string) => {
-    if (!user) {
-      alert("正在连接宇宙，请稍候...");
-      return;
-    }
     try {
       const docRef = await addDoc(collection(db, "messages"), {
         content: msg,
         color: activeColor,
-        authorId: user.uid,
+        authorId: guestId,
         createdAt: serverTimestamp()
       });
-      // Local shout for immediate feedback
       const localShout: Shout = {
         id: "local-" + docRef.id,
         content: msg,
@@ -766,29 +789,20 @@ export default function App() {
   };
 
   const addQuote = async (cat: Category, content: string) => {
-    if (!user) {
-      alert("正在连接宇宙，请稍候...");
-      return;
-    }
     try {
       const docRef = await addDoc(collection(db, "quotes"), {
         content,
         category: cat,
-        authorId: user.uid,
+        authorId: guestId,
         createdAt: serverTimestamp()
       });
-      // Immediate feedback: show the fresh quote
       setCurrentQuote({ id: docRef.id, content });
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, "quotes");
     }
   };
 
-  const login = async () => {
-    // Legacy - not used but kept for internal safety if needed
-  };
-
-  const logout = () => signOut(auth);
+  const logout = () => {};
 
   useEffect(() => {
     generateNewQuote();
@@ -826,18 +840,6 @@ export default function App() {
 
       {/* Flying Shouts Layer */}
       <FlyingShouts shouts={shouts} />
-
-      {/* Auth Status (Guest Style) */}
-      <div className="fixed top-6 right-8 z-[100]">
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2 px-4 py-2 bg-white/5 backdrop-blur-md rounded-full border border-white/10 shadow-lg">
-            <User size={14} className="text-white/40" />
-            <span className="text-[10px] font-black uppercase text-white/60 tracking-wider">
-              {user ? "疯友 · Guest" : "正在接入宇宙..."}
-            </span>
-          </div>
-        </div>
-      </div>
 
       {/* Elastic Emoji Cursor */}
       <ElasticCursor />
